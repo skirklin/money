@@ -1,7 +1,10 @@
-"""Morgan Stanley Shareworks ingester — parses captured network log data."""
+"""Morgan Stanley Shareworks ingester — uses JWT from network log + REST API."""
 
 import json
 import logging
+import time
+import urllib.error
+import urllib.request
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -80,25 +83,7 @@ def parse_raw_morgan_stanley(
 
     # Total balance from portfolio summary
     portfolio_items = summary.portfolioData
-    available_total = 0.0
-    future_total = 0.0
-    for item in portfolio_items:
-        available_total += parse_money(item.availableValue)
-        for f in item.futureData:
-            future_total += parse_money(f.value)
-    total_value = available_total + future_total
-
     raw_key = f"morgan_stanley/{profile}/{timestamp}_portfolio_summary.json"
-
-    db.insert_balance(
-        Balance(
-            account_id=account.id,
-            as_of=as_of,
-            balance=total_value,
-            source="morgan_stanley_api",
-            raw_file_ref=raw_key,
-        )
-    )
 
     # FMV (409A valuation)
     if fmv_price > 0:
@@ -168,7 +153,32 @@ def parse_raw_morgan_stanley(
             vested_qty, vested_val,
         )
 
-    log.info("Morgan Stanley: parsed snapshot %s (%d grants)", timestamp, grant_count)
+    # Store after-tax vested value as the balance (not gross paper value).
+    # This is what the equity chart displays and correctly reflects exercises.
+    after_tax_vested = 0.0
+    for item in portfolio_items:
+        if item.instanceName is None:
+            continue
+        avail_val = parse_money(item.availableValue)
+        if avail_val <= 0:
+            continue
+        # Determine grant type from instance name for tax rate
+        name = item.instanceName
+        tax_rate = 0.35 if "ISO" in name else 0.50
+        after_tax_vested += avail_val * (1 - tax_rate)
+
+    db.insert_balance(
+        Balance(
+            account_id=account.id,
+            as_of=as_of,
+            balance=after_tax_vested,
+            source="morgan_stanley_api",
+            raw_file_ref=raw_key,
+        )
+    )
+
+    log.info("Morgan Stanley: parsed snapshot %s (%d grants, after-tax vested $%.0f)",
+             timestamp, grant_count, after_tax_vested)
     return {"grants": grant_count}
 
 
@@ -185,47 +195,65 @@ def sync_morgan_stanley(
     try:
         from money.config import DATA_DIR
 
-        # Load and merge all network log files
+        BASE_URL = "https://shareworks.solium.com"
+        USER_AGENT = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+        )
+
+        # Only use recent network logs (< 5 min old), clean up stale ones
         log_dir = DATA_DIR / "network_logs"
-        logs = sorted(log_dir.glob("morgan_stanley_*.json")) if log_dir.exists() else []
+        now = time.time()
+        all_ms_logs = sorted(log_dir.glob("morgan_stanley_*.json")) if log_dir.exists() else []
+        logs = [f for f in all_ms_logs if now - f.stat().st_mtime < 300]
+        for stale in all_ms_logs:
+            if now - stale.stat().st_mtime >= 300:
+                stale.unlink()
+
         if not logs:
             raise FileNotFoundError(
-                "No Morgan Stanley network logs found. Visit Shareworks in Chrome."
+                "No recent Morgan Stanley network logs. Visit Shareworks in Chrome."
             )
 
+        # Merge entries and extract JWT
         all_entries: list[dict[str, Any]] = []
         for log_file in logs:
-            file_data: dict[str, Any] = json.loads(log_file.read_text())
+            file_data = json.loads(log_file.read_text())
             all_entries.extend(file_data.get("entries", []))
-        log.info("Loaded %d entries from %d network log files", len(all_entries), len(logs))
+        log.info("Loaded %d entries from %d recent log files", len(all_entries), len(logs))
 
-        # Extract portfolio summary and grants from captured responses
-        summary_data: dict[str, Any] | None = None
-        grants_data: dict[str, Any] | None = None
-
+        bearer_token: str | None = None
         for entry in all_entries:
-            url: str = entry.get("url", "")
-            body = entry.get("responseBody")
-            if not isinstance(body, dict):
-                continue
-            if "portfolio/summary" in url and body.get("data"):
-                summary_data = body
-            elif url.endswith("/grants") and body.get("data"):
-                grants_data = body
+            headers: dict[str, str] = entry.get("requestHeaders", {})
+            auth = headers.get("Authorization", headers.get("authorization", ""))
+            if auth.startswith("Bearer ") and len(auth) > 50:
+                bearer_token = auth[7:]
+                break
 
-        if summary_data is None:
-            raise ValueError(
-                "No portfolio/summary response found in network log. "
-                "Navigate to the Portfolio page on Shareworks."
-            )
-        if grants_data is None:
-            raise ValueError(
-                "No grants response found in network log. "
-                "Navigate to the Grants page on Shareworks."
-            )
+        if not bearer_token:
+            raise ValueError("No Bearer JWT found in recent network logs.")
+        log.info("Extracted JWT from network log")
 
-        # Store in the format parse_raw_morgan_stanley expects
+        def _api_get(path: str) -> dict[str, Any]:
+            req = urllib.request.Request(f"{BASE_URL}{path}")
+            req.add_header("Authorization", f"Bearer {bearer_token}")
+            req.add_header("Accept", "application/json")
+            req.add_header("User-Agent", USER_AGENT)
+            req.add_header("Cache-Control", "no-cache")
+            try:
+                resp = urllib.request.urlopen(req, timeout=30)
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", errors="replace")[:500]
+                log.error("HTTP %d on %s: %s", e.code, path, body)
+                raise
+            result: dict[str, Any] = json.loads(resp.read())
+            return result
+
+        # Fetch portfolio summary and grants using the JWT
+        summary_data = _api_get("/rest/participant/v2/portfolio/summary")
         store.put(raw_key, json.dumps(summary_data, indent=2).encode())
+
+        grants_data = _api_get("/rest/participant/v2/grants")
         store.put(
             f"morgan_stanley/{profile}/{timestamp}_grants.json",
             json.dumps(grants_data, indent=2).encode(),

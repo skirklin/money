@@ -236,6 +236,10 @@ function makeContext(institution, tabId) {
       return null;
     },
 
+    getBufferedEntries() {
+      return networkBuffer[institution] || [];
+    },
+
     async flushNetworkLog() {
       const entries = networkBuffer[institution] || [];
       if (entries.length === 0) {

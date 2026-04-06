@@ -270,6 +270,75 @@ class IngestHandler(BaseHTTPRequestHandler):
                 (row["date"], row["balance"], 0.0, 0.0)
             )
 
+        # Backfill equity accounts with vest-schedule data for dates before
+        # the first balance snapshot. Balance snapshots (which now store after-tax
+        # vested value) are ground truth once we have them; the vest schedule
+        # fills in the curve from when vesting started until first sync.
+        import json as _json
+
+        fmv_row = self.db.conn.execute(
+            "SELECT fmv_per_share FROM private_valuations ORDER BY as_of DESC LIMIT 1"
+        ).fetchone()
+        fmv = float(fmv_row["fmv_per_share"]) if fmv_row else 0.0
+
+        if fmv > 0 and equity_accounts:
+            grant_rows = self.db.conn.execute("""
+                SELECT grant_type, total_shares, strike_price, vest_dates
+                FROM option_grants
+            """).fetchall()
+
+            vest_events: list[tuple[str, float]] = []
+            for g in grant_rows:
+                raw = g["vest_dates"]
+                if not raw:
+                    continue
+                dates: list[str] = _json.loads(raw) if isinstance(raw, str) else raw
+                if not dates:
+                    continue
+                per_share = fmv - g["strike_price"]
+                if per_share <= 0:
+                    continue
+                shares_per = g["total_shares"] / len(dates)
+                tax = 0.35 if g["grant_type"] == "ISO" else 0.50
+                val_per = shares_per * per_share * (1 - tax)
+                for d in dates:
+                    vest_events.append((d, val_per))
+            vest_events.sort()
+
+            for aid in equity_accounts:
+                existing_dates = sorted(d for d, _, _, _ in account_data.get(aid, []))
+                first_balance = existing_dates[0] if existing_dates else None
+                first_balance_val = next(
+                    (v for d, v, _, _ in account_data.get(aid, []) if d == first_balance),
+                    None,
+                ) if first_balance else None
+
+                # Build raw backfill from vest schedule
+                cumulative = 0.0
+                raw_points: list[tuple[str, float]] = []
+                for vd, val in vest_events:
+                    if first_balance and vd >= first_balance:
+                        break
+                    cumulative += val
+                    if cumulative > 0:
+                        raw_points.append((vd, cumulative))
+
+                if raw_points:
+                    # Scale the backfill so it arrives at the first balance
+                    # snapshot value, eliminating the discontinuity
+                    last_backfill_val = raw_points[-1][1]
+                    if first_balance_val and last_backfill_val > 0:
+                        scale = first_balance_val / last_backfill_val
+                    else:
+                        scale = 1.0
+
+                    backfill = [
+                        (vd, val * scale, 0.0, 0.0) for vd, val in raw_points
+                    ]
+                    if aid not in account_data:
+                        account_data[aid] = []
+                    account_data[aid] = backfill + account_data[aid]
+
         # Collect all unique dates and forward-fill each account
         all_dates: set[str] = set()
         for points in account_data.values():
@@ -288,68 +357,25 @@ class IngestHandler(BaseHTTPRequestHandler):
                 lookup[d] = (bal, inv, ear)
             account_series[aid] = lookup
 
-        # Compute equity from grant vesting schedules instead of balance snapshots
-        # Load grants and FMV
-        grant_rows = self.db.conn.execute("""
-            SELECT grant_type, total_shares, strike_price, vest_dates
-            FROM option_grants
-        """).fetchall()
-        fmv_row = self.db.conn.execute(
-            "SELECT fmv_per_share FROM private_valuations ORDER BY as_of DESC LIMIT 1"
-        ).fetchone()
-        fmv = float(fmv_row["fmv_per_share"]) if fmv_row else 0.0
-
-        # Parse grants into a list of (vest_date, shares_per_vest, strike, grant_type)
-        import json as _json
-        vest_events: list[tuple[str, float, float, str]] = []
-        for g in grant_rows:
-            vest_dates_raw = g["vest_dates"]
-            if not vest_dates_raw:
-                continue
-            dates: list[str] = (
-                _json.loads(vest_dates_raw) if isinstance(vest_dates_raw, str)
-                else vest_dates_raw
-            )
-            if not dates:
-                continue
-            shares_per_vest = g["total_shares"] / len(dates)
-            for vd in dates:
-                vest_events.append((vd, shares_per_vest, g["strike_price"], g["grant_type"]))
-        vest_events.sort(key=lambda x: x[0])
-
-        def compute_equity(as_of: str) -> float:
-            """Compute after-tax vested equity value as of a given date."""
-            total = 0.0
-            for vd, shares, strike, gtype in vest_events:
-                if vd > as_of:
-                    continue
-                per_share = fmv - strike
-                if per_share <= 0:
-                    continue
-                value = shares * per_share
-                # After-tax: ~35% for ISO, ~50% for NQ/RSU
-                tax_rate = 0.35 if gtype == "ISO" else 0.50
-                total += value * (1 - tax_rate)
-            return total
-
-        # Forward-fill liquid accounts, compute equity per date
+        # Forward-fill all accounts, split into liquid vs equity
         series: list[dict[str, Any]] = []
         last_known: dict[str, tuple[float, float, float]] = {}
         for d in sorted_dates:
             liquid = 0.0
+            equity = 0.0
             total_inv = 0.0
             total_ear = 0.0
             for aid in account_data:
-                if aid in equity_accounts:
-                    continue  # equity computed from grants, not balances
                 if d in account_series[aid]:
                     last_known[aid] = account_series[aid][d]
                 if aid in last_known:
                     bal, inv, ear = last_known[aid]
-                    liquid += bal
+                    if aid in equity_accounts:
+                        equity += bal
+                    else:
+                        liquid += bal
                     total_inv += inv
                     total_ear += ear
-            equity = compute_equity(d)
             series.append(
                 {
                     "date": d,
